@@ -1,0 +1,133 @@
+import React, { useState, useRef } from "react";
+import { View, Text, StyleSheet, TouchableOpacity } from "react-native";
+import MapView, { Marker, Polygon } from "react-native-maps";
+import * as Location from "expo-location";
+
+export default function App() {
+  const mapRef = useRef(null);
+  const [points, setPoints] = useState([]);
+  const [errorMsg, setErrorMsg] = useState(null);
+
+  const getLocation = async () => {
+    if (mapRef.current) {
+      const region = await mapRef.current.getMapBoundaries();
+      const centerLatitude = (region.northEast.latitude + region.southWest.latitude) / 2;
+      const centerLongitude = (region.northEast.longitude + region.southWest.longitude) / 2;
+      const newPoint = { latitude: centerLatitude, longitude: centerLongitude };
+      
+      setPoints((prevPoints) => {
+        if (prevPoints.length < 4) {
+          return [...prevPoints, newPoint];
+        } else {
+          return [newPoint];
+        }
+      });
+    }
+  };
+
+  return (
+    <View style={styles.container}>
+      <MapView
+        ref={mapRef}
+        style={styles.map}
+        initialRegion={{
+          latitude: 14.5995,
+          longitude: 120.9842,
+          latitudeDelta: 0.01,
+          longitudeDelta: 0.01,
+        }}
+      >
+        {points.map((point, index) => (
+          <Marker key={index} coordinate={point} title={`Point ${index + 1}`} />
+        ))}
+
+        {points.length === 4 && <Polygon coordinates={points} fillColor="rgba(0,0,255,0.3)" strokeColor="blue" strokeWidth={2} />}
+      </MapView>
+
+      {/* Crosshair Indicator */}
+      <View style={styles.crosshair}>
+        <Text style={styles.crosshairText}>+</Text>
+      </View>
+
+      {/* Button to Get Coordinates */}
+      <TouchableOpacity style={styles.button} onPress={getLocation}>
+        <Text style={styles.buttonText}>Get Location</Text>
+      </TouchableOpacity>
+
+      {/* Display Coordinates */}
+      {points.length > 0 && (
+        <View style={styles.locationBox}>
+          {points.map((point, index) => (
+            <Text key={index} style={styles.locationText}>
+              📍 Point {index + 1}: {point.latitude.toFixed(6)}, {point.longitude.toFixed(6)}
+            </Text>
+          ))}
+        </View>
+      )}
+
+      {errorMsg && <Text style={styles.error}>{errorMsg}</Text>}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  map: {
+    width: "100%",
+    height: "100%",
+  },
+  crosshair: {
+    position: "absolute",
+    top: "50%",
+    left: "50%",
+    transform: [{ translateX: -10 }, { translateY: -10 }],
+  },
+  crosshairText: {
+    fontSize: 24,
+    fontWeight: "bold",
+    color: "red",
+  },
+  button: {
+    position: "absolute",
+    bottom: 150,  
+    left: "50%",
+    transform: [{ translateX: -75 }],
+    backgroundColor: "blue",
+    paddingVertical: 10, 
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    width: 150,
+    alignItems: "center",
+    justifyContent: "center", 
+},
+buttonText: {
+    color: "white",
+    fontSize: 16,
+    fontWeight: "bold",
+},
+  locationBox: {
+    position: "absolute",
+    bottom: 40,
+    left: "50%",
+    transform: [{ translateX: -100 }],
+    backgroundColor: "rgba(0, 0, 0, 0.7)",
+    padding: 10,
+    borderRadius: 10,
+    width: 250,
+    alignItems: "center",
+  },
+  locationText: {
+    color: "white",
+    fontSize: 14,
+    fontWeight: "bold",
+    textAlign: "center",
+  },
+  error: {
+    fontSize: 18,
+    color: "red",
+    textAlign: "center",
+    marginTop: 20,
+  },
+});

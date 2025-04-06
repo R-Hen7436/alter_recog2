@@ -1,106 +1,39 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Image, Alert } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, Alert, ActivityIndicator, ScrollView, Modal, Image, FlatList } from 'react-native';
 import io from 'socket.io-client';
-import { uploadImage } from '../utils/firebase';
-import Zeroconf from 'react-native-zeroconf';
+import { uploadImage, getUploadedImagesInfo, listImages, trackUpload } from '../utils/imgbbStorage';
 import { WebView } from 'react-native-webview';
 
 export default function LiveFeedScreen() {
   const [connected, setConnected] = useState(false);
   const [currentFrame, setCurrentFrame] = useState(null);
-  const [nextFrame, setNextFrame] = useState(null); // For double buffering
-  const [isFrameLoaded, setIsFrameLoaded] = useState(false);
-  const [activeImageIndex, setActiveImageIndex] = useState(0); // Track which image is active
   const [faceData, setFaceData] = useState([]);
   const [uploading, setUploading] = useState(false);
-  const [serverAddress, setServerAddress] = useState(null);
-  const [scanning, setScanning] = useState(true);
+  const [serverAddress, setServerAddress] = useState('http://192.168.1.4:5000');
+  const [streamUrl, setStreamUrl] = useState(null);
+  const [loadingWebView, setLoadingWebView] = useState(true);
+  const [checkingStorage, setCheckingStorage] = useState(false);
+  const [storageInfo, setStorageInfo] = useState(null);
+  const [showStorageModal, setShowStorageModal] = useState(false);
+  const [uploadedImages, setUploadedImages] = useState([]);
+  const [selectedImage, setSelectedImage] = useState(null);
   const socketRef = useRef(null);
-  const zeroconfRef = useRef(null);
-  const [lastFrameTime, setLastFrameTime] = useState(0);
-  const minFrameInterval = 50; // Minimum 50ms between frames (maximum 20 FPS)
-  const [streamQuality, setStreamQuality] = useState('medium'); // 'low', 'medium', 'high'
-  const [imageOpacity, setImageOpacity] = useState(1);
-  const [frameBuffer, setFrameBuffer] = useState([]);
-  const frameProcessorRef = useRef(null);
-  const [frameData, setFrameData] = useState(null); // Single source of truth
-  const [isReady, setIsReady] = useState(false);    // Track when the component is fully initialized
-  const imageElement1 = useRef(null);
-  const imageElement2 = useRef(null);
-  const [visibleImageIndex, setVisibleImageIndex] = useState(0);
-  const lastFrameReceived = useRef('');
-  const frameTimer = useRef(null);
-
-  // Initialize zeroconf and scan for the server
+  const webViewRef = useRef(null);
+  const [forceHideLoading, setForceHideLoading] = useState(false);
+  
   useEffect(() => {
-    try {
-      // Create a slight delay before initializing Zeroconf
-      setTimeout(() => {
-        try {
-          // Initialize Zeroconf with error handling
-          const zeroconf = new Zeroconf();
-          zeroconfRef.current = zeroconf;
-          
-          zeroconf.on('resolved', service => {
-            if (service.name === 'FaceDetectionServer') {
-              const host = service.addresses[0];
-              const port = service.port;
-              setServerAddress(`http://${host}:${port}`);
-              setScanning(false);
-            }
-          });
-          
-          zeroconf.on('error', err => {
-            console.error('Zeroconf error:', err);
-            setScanning(false);
-            Alert.alert(
-              "Connection Error",
-              "Couldn't find the face detection server. Please connect manually."
-            );
-          });
-          
-          // Add error handling for scan
-          try {
-            zeroconf.scan('http', 'tcp', 'local.');
-            console.log('Started Zeroconf scan successfully');
-          } catch (scanError) {
-            console.error('Error scanning:', scanError);
-            setScanning(false);
-            // Fall back to manual connection
-            setServerAddress('http://192.168.1.4:5000'); // Updated to your actual server IP
-          }
-        } catch (initError) {
-          console.error('Error initializing Zeroconf:', initError);
-          setScanning(false);
-          // Fall back to manual connection
-          setServerAddress('http://192.168.1.4:5000'); // Updated to your actual server IP
-        }
-      }, 1000); // Add a 1 second delay
-      
-      return () => {
-        if (zeroconfRef.current) {
-          try {
-            zeroconfRef.current.stop();
-          } catch (error) {
-            console.error('Error stopping Zeroconf:', error);
-          }
-        }
-      };
-    } catch (error) {
-      console.error('Top level error in Zeroconf initialization:', error);
-      setScanning(false);
-      // Fall back to manual connection
-      setServerAddress('http://192.168.1.4:5000'); // Updated to your actual server IP
-    }
+    console.log('Using server address:', serverAddress);
+    connectToServer();
+    
+    return () => {
+      disconnectServer();
+    };
   }, []);
 
-  // Connect to socket.io server once we have the address
-  useEffect(() => {
-    if (!serverAddress) return;
-    
+  const connectToServer = () => {
     console.log(`Connecting to server at ${serverAddress}`);
     const socket = io(serverAddress, {
-      transports: ['websocket'],  // Force WebSocket transport
+      transports: ['websocket'],
       reconnection: true,
       reconnectionAttempts: 5,
       reconnectionDelay: 1000
@@ -114,6 +47,9 @@ export default function LiveFeedScreen() {
       // Request video stream on connection
       socket.emit('request_stream');
       console.log('Requested video stream');
+      
+      // Set quality to medium immediately after connection
+      socket.emit('set_quality', { quality: 'medium' });
     });
     
     socket.on('disconnect', () => {
@@ -121,7 +57,6 @@ export default function LiveFeedScreen() {
       console.log('Disconnected from camera server');
     });
     
-    // Handle face detection events (may contain face data)
     socket.on('face_detected', (data) => {
       if (data && data.image) {
         setCurrentFrame(`data:image/jpeg;base64,${data.image}`);
@@ -132,288 +67,400 @@ export default function LiveFeedScreen() {
       }
     });
     
-    // Handle continuous frame updates
-    socket.on('frame_update', (data) => {
-      if (data && data.image && isReady) {
-        const now = Date.now();
-        if (now - lastFrameTime >= 150) { // Keep the rate limit
-          // Store the latest frame data but don't render it immediately
-          lastFrameReceived.current = `data:image/jpeg;base64,${data.image}`;
-          setLastFrameTime(now);
-          
-          // Update face data if present
-          if (data.faces) {
-            setFaceData(data.faces);
-          }
-          
-          // Schedule frame processing if not already scheduled
-          if (!frameTimer.current) {
-            frameTimer.current = setTimeout(processNewFrame, 10);
-          }
-        }
+    socket.on('stream_acknowledged', (data) => {
+      console.log('Stream acknowledged:', data);
+      if (data.stream_url) {
+        setStreamUrl(data.stream_url);
       }
     });
     
-    return () => {
-      if (socket) {
-        console.log('Disconnecting socket');
-        socket.disconnect();
+    socket.on('frame_update', (data) => {
+      if (data && data.faces) {
+        setFaceData(data.faces);
       }
-    };
-  }, [serverAddress, isReady]);
+    });
+  };
 
-  // Add this useEffect to handle image loaded events and swap buffers
-  useEffect(() => {
-    if (isFrameLoaded) {
-      // Toggle which image is displayed to swap between buffers
-      setActiveImageIndex(prev => prev === 0 ? 1 : 0);
-      setIsFrameLoaded(false);
+  const disconnectServer = () => {
+    if (socketRef.current) {
+      console.log('Disconnecting socket');
+      socketRef.current.disconnect();
     }
-  }, [isFrameLoaded]);
+  };
 
-  const captureFace = async (faceIndex) => {
-    if (!currentFrame) return;
+  const changeServerIP = () => {
+    const newIP = prompt("Enter server IP address:", "192.168.1.4");
+    if (newIP) {
+      disconnectServer();
+      setServerAddress(`http://${newIP}:5000`);
+      setTimeout(connectToServer, 500);
+    }
+  };
+
+  const captureFrame = async () => {
+    if (!socketRef.current || !socketRef.current.connected) {
+      Alert.alert('Connection Error', 'Not connected to detection server');
+      return;
+    }
+    
+    setUploading(true);
     
     try {
-      setUploading(true);
-      
-      // Create a filename with timestamp
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = `face_${faceIndex}_${timestamp}.jpg`;
       
-      // Extract the base64 data from the image string
-      const base64Data = currentFrame.split(',')[1];
+      console.log('Capturing frame...');
+      socketRef.current.emit('request_capture');
       
-      // Create a URI for the image
-      const imageUri = `data:image/jpeg;base64,${base64Data}`;
-      
-      // Upload to Firebase
-      const downloadURL = await uploadImage(imageUri, filename);
-      
-      Alert.alert(
-        "Person Captured", 
-        "Person has been captured and uploaded to cloud storage.",
-        [{ text: "OK" }]
-      );
-    } catch (error) {
-      Alert.alert("Error", "Failed to capture and upload image.");
-      console.error(error);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const captureFull = async () => {
-    if (!currentFrame) return;
-    
-    try {
-      setUploading(true);
-      
-      // Create a filename with timestamp
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = `full_capture_${timestamp}.jpg`;
-      
-      // Extract the base64 data from the image string
-      const base64Data = currentFrame.split(',')[1];
-      
-      // Create a URI for the image
-      const imageUri = `data:image/jpeg;base64,${base64Data}`;
-      
-      // Upload to Firebase
-      const downloadURL = await uploadImage(imageUri, filename);
-      
-      Alert.alert(
-        "Image Captured", 
-        "Full frame has been captured and uploaded to cloud storage.",
-        [{ text: "OK" }]
-      );
-    } catch (error) {
-      Alert.alert("Error", "Failed to capture and upload image.");
-      console.error(error);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const requestQualityChange = (quality) => {
-    if (socketRef.current && socketRef.current.connected) {
-      socketRef.current.emit('set_quality', { quality });
-      setStreamQuality(quality);
-    }
-  };
-
-  // Add this cleanup logic to prevent memory leaks
-  useEffect(() => {
-    // Cleanup function to run when component unmounts
-    return () => {
-      // Clear any pending frame processing
-      if (frameProcessorRef.current) {
-        clearTimeout(frameProcessorRef.current);
-      }
-      
-      // Disconnect socket
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-      }
-      
-      // Clear frame data to free memory
-      setCurrentFrame(null);
-      setNextFrame(null);
-      setFaceData([]);
-    };
-  }, []);
-
-  // Add this function to process new frames with better timing control
-  const processNewFrame = () => {
-    // Clear the timer reference
-    frameTimer.current = null;
-    
-    // Only update if we have a new frame
-    if (lastFrameReceived.current) {
-      // Update the invisible image first
-      const nextIndex = visibleImageIndex === 0 ? 1 : 0;
-      const nextRef = nextIndex === 0 ? imageElement1 : imageElement2;
-      
-      // Use a setTimeout to ensure the DOM has a chance to update
-      setFrameData({
-        uri: lastFrameReceived.current,
-        timestamp: Date.now()
+      // Add timeout for capture request
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Capture request timed out')), 10000);
       });
       
-      // Switch the visible image after a short delay
-      setTimeout(() => {
-        setVisibleImageIndex(nextIndex);
-      }, 50); // Small delay to ensure the image is loaded
+      // Wait for the capture result
+      const resultPromise = new Promise((resolve) => {
+        socketRef.current.once('capture_result', resolve);
+      });
+      
+      // Race between timeout and result
+      const captureData = await Promise.race([resultPromise, timeoutPromise]);
+      
+      if (captureData.error) {
+        throw new Error(captureData.error);
+      }
+      
+      if (!captureData.image) {
+        throw new Error('No image data received');
+      }
+      
+      // Upload the captured frame
+      const filename = `capture_${timestamp}.jpg`;
+      const imageUri = `data:image/jpeg;base64,${captureData.image}`;
+      
+      console.log('Uploading captured frame...');
+      const result = await uploadImage(imageUri, filename);
+      trackUpload(result);
+      
+      console.log('Successfully uploaded frame to ImgBB:', result.url);
+      
+      Alert.alert(
+        "Frame Captured",
+        "Image has been captured and uploaded to cloud storage. You can view it by clicking 'View Uploaded Images'.",
+        [{ text: "OK" }]
+      );
+    } catch (error) {
+      console.error("Error in capture process:", error);
+      Alert.alert("Error", `Failed to capture image: ${error.message}`);
+    } finally {
+      setUploading(false);
     }
   };
 
-  // Add this effect to mark when the component is ready for frame processing
+  // Function to check ImgBB storage
+  const checkStorage = async () => {
+    try {
+      setCheckingStorage(true);
+      
+      const info = getUploadedImagesInfo();
+      setStorageInfo(info);
+      
+      const images = listImages();
+      setUploadedImages(images);
+      
+      setShowStorageModal(true);
+    } catch (error) {
+      console.error("Error checking storage:", error);
+      Alert.alert("Storage Check Error", `Could not check storage: ${error.message}`);
+    } finally {
+      setCheckingStorage(false);
+    }
+  };
+
+  // Add the WebView message handler function
+  const handleWebViewMessage = (event) => {
+    try {
+      const data = JSON.parse(event.nativeEvent.data);
+      
+      if (data.type === 'contentCheck' && data.hasContent) {
+        setLoadingWebView(false);
+        console.log('Content detected in WebView');
+      }
+      
+      if (data.type === 'pageLoaded') {
+        setLoadingWebView(false);
+        console.log('WebView page loaded');
+      }
+    } catch (error) {
+      console.log('Error parsing WebView message:', error);
+    }
+  };
+
+  // Add the WebView injection script
+  const WEBVIEW_INJECT_SCRIPT = `
+    (function() {
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'pageStartedLoading',
+        time: Date.now()
+      }));
+
+      function checkContent() {
+        const hasContent = document.body && 
+          (document.getElementsByTagName('video').length > 0 ||
+           document.getElementsByTagName('img').length > 0 ||
+           document.getElementsByTagName('canvas').length > 0);
+
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'contentCheck',
+          hasContent: hasContent,
+          time: Date.now()
+        }));
+
+        if (!hasContent) {
+          setTimeout(checkContent, 500);
+        }
+      }
+
+      checkContent();
+
+      window.addEventListener('load', function() {
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'pageLoaded',
+          time: Date.now()
+        }));
+        checkContent();
+      });
+
+      true;
+    })();
+  `;
+
+  // Add useEffect for loading indicator timeout
   useEffect(() => {
-    const readyTimer = setTimeout(() => {
-      setIsReady(true);
-    }, 500); // Give time for initial setup
-    
-    return () => clearTimeout(readyTimer);
-  }, []);
+    if (streamUrl) {
+      const hideTimer = setTimeout(() => {
+        setForceHideLoading(true);
+        setLoadingWebView(false);
+      }, 5000); // Force hide after 5 seconds
+      
+      return () => clearTimeout(hideTimer);
+    }
+  }, [streamUrl]);
 
   return (
     <View style={styles.container}>
       <View style={styles.statusBar}>
-        {scanning ? (
-          <>
-            <Text style={styles.scanningText}>Scanning for camera server...</Text>
-            <TouchableOpacity 
-              style={styles.manualButton}
-              onPress={() => {
-                setServerAddress('http://192.168.1.4:5000'); // Updated to your actual server IP
-                setScanning(false);
-              }}
-            >
-              <Text style={styles.buttonText}>Connect Manually</Text>
-            </TouchableOpacity>
-          </>
-        ) : (
-          <>
-            <Text style={[styles.statusText, { color: connected ? 'green' : 'red' }]}>
-              {connected ? 'Connected' : 'Disconnected'}
-            </Text>
-            <Text style={styles.facesText}>Persons: {faceData.length}</Text>
-          </>
+        <Text style={[styles.statusText, { color: connected ? 'green' : 'red' }]}>
+          {connected ? 'Connected' : 'Disconnected'}
+        </Text>
+        <Text style={styles.facesText}>Persons: {faceData.length}</Text>
+        {!connected && (
+          <TouchableOpacity 
+            style={styles.manualButton}
+            onPress={changeServerIP}
+          >
+            <Text style={styles.buttonText}>Change IP</Text>
+          </TouchableOpacity>
         )}
       </View>
       
       <View style={styles.feedContainer}>
-        {frameData ? (
+        {streamUrl ? (
           <>
-            <Image
-              ref={imageElement1}
-              source={{ uri: frameData.uri }}
-              style={[
-                styles.cameraFeed,
-                {
-                  opacity: visibleImageIndex === 0 ? 1 : 0,
-                  zIndex: visibleImageIndex === 0 ? 2 : 1
+            <WebView
+              ref={webViewRef}
+              source={{ uri: streamUrl }}
+              style={styles.webView}
+              onLoadStart={() => {
+                if (!forceHideLoading) {
+                  setLoadingWebView(true);
                 }
-              ]}
-              resizeMode="contain"
-              fadeDuration={0}
+              }}
+              onLoad={() => setLoadingWebView(false)}
+              onLoadEnd={() => setLoadingWebView(false)}
+              onError={(e) => {
+                console.log('WebView error:', e.nativeEvent);
+                setLoadingWebView(false);
+              }}
+              onMessage={handleWebViewMessage}
+              injectedJavaScript={WEBVIEW_INJECT_SCRIPT}
+              javaScriptEnabled={true}
+              domStorageEnabled={true}
+              allowsInlineMediaPlayback={true}
+              mediaPlaybackRequiresUserAction={false}
+              scrollEnabled={false}
+              bounces={false}
+              originWhitelist={['*']}
+              mixedContentMode="always"
+              androidHardwareAccelerationDisabled={false}
+              androidLayerType="hardware"
             />
-            <Image
-              ref={imageElement2}
-              source={{ uri: frameData.uri }}
-              style={[
-                styles.cameraFeed,
-                {
-                  opacity: visibleImageIndex === 1 ? 1 : 0,
-                  zIndex: visibleImageIndex === 1 ? 2 : 1
-                }
-              ]}
-              resizeMode="contain"
-              fadeDuration={0}
-            />
+            
+            {(streamUrl && !forceHideLoading && loadingWebView) && (
+              <TouchableOpacity 
+                style={styles.loadingContainer}
+                activeOpacity={0.9}
+                onPress={() => {
+                  setForceHideLoading(true);
+                  setLoadingWebView(false);
+                }}
+              >
+                <ActivityIndicator size="large" color="#2196F3" />
+                <Text style={styles.loadingText}>Loading video stream...</Text>
+                <Text style={styles.tapToDismissText}>Tap anywhere to dismiss</Text>
+              </TouchableOpacity>
+            )}
           </>
         ) : (
           <View style={styles.noFeedContainer}>
-            <Text style={styles.noFeedText}>Waiting for camera feed...</Text>
+            <Text style={styles.noFeedText}>Waiting for camera stream...</Text>
+            {!connected && (
+              <TouchableOpacity 
+                style={styles.retryButton}
+                onPress={() => {
+                  if (serverAddress) {
+                    setServerAddress(null);
+                    setTimeout(() => setServerAddress(serverAddress), 100);
+                  } else {
+                    setServerAddress('http://192.168.1.4:5000');
+                  }
+                }}
+              >
+                <Text style={styles.buttonText}>Retry Connection</Text>
+              </TouchableOpacity>
+            )}
           </View>
         )}
-        
-        {/* Render face indicators */}
-        {faceData.map((face, index) => (
-          <TouchableOpacity
-            key={index}
-            style={[
-              styles.faceIndicator,
-              {
-                left: face.x,
-                top: face.y,
-                width: face.width,
-                height: face.height,
-              }
-            ]}
-            onPress={() => captureFace(index)}
-            disabled={uploading}
-          >
-            <Text style={styles.faceText}>{index + 1}</Text>
-          </TouchableOpacity>
-        ))}
       </View>
       
       <View style={styles.buttonContainer}>
         <TouchableOpacity 
           style={[styles.button, uploading && styles.buttonDisabled]} 
-          onPress={captureFull}
-          disabled={uploading || !currentFrame}
+          onPress={captureFrame}
+          disabled={uploading || !streamUrl}
         >
           <Text style={styles.buttonText}>
-            {uploading ? 'Uploading...' : 'Capture Full Frame'}
+            {uploading ? 'Uploading...' : 'Capture'}
+          </Text>
+        </TouchableOpacity>
+        
+        <TouchableOpacity 
+          style={[styles.button, styles.storageButton, checkingStorage && styles.buttonDisabled]} 
+          onPress={checkStorage}
+          disabled={checkingStorage}
+        >
+          <Text style={styles.buttonText}>
+            {checkingStorage ? 'Checking Storage...' : 'View Uploaded Images'}
           </Text>
         </TouchableOpacity>
       </View>
 
-      <View style={styles.qualityControls}>
-        <Text style={styles.controlLabel}>Stream Quality:</Text>
-        <View style={styles.qualityButtons}>
-          <TouchableOpacity 
-            style={[styles.qualityButton, streamQuality === 'low' && styles.activeQuality]} 
-            onPress={() => requestQualityChange('low')}
-          >
-            <Text style={styles.qualityText}>Low</Text>
-          </TouchableOpacity>
-          <TouchableOpacity 
-            style={[styles.qualityButton, streamQuality === 'medium' && styles.activeQuality]} 
-            onPress={() => requestQualityChange('medium')}
-          >
-            <Text style={styles.qualityText}>Medium</Text>
-          </TouchableOpacity>
-          <TouchableOpacity 
-            style={[styles.qualityButton, streamQuality === 'high' && styles.activeQuality]} 
-            onPress={() => requestQualityChange('high')}
-          >
-            <Text style={styles.qualityText}>High</Text>
-          </TouchableOpacity>
+      {/* Storage Info Modal - remains unchanged */}
+      <Modal
+        visible={showStorageModal}
+        animationType="slide"
+        transparent={false}
+        onRequestClose={() => setShowStorageModal(false)}
+      >
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Uploaded Images (ImgBB Storage)</Text>
+            <TouchableOpacity
+              style={styles.closeButton}
+              onPress={() => setShowStorageModal(false)}
+            >
+              <Text style={styles.closeButtonText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+          
+          {storageInfo && (
+            <View style={styles.storageInfo}>
+              <View style={styles.storageInfoRow}>
+                <Text style={styles.storageInfoText}>
+                  Total Files: {storageInfo.totalFiles}
+                </Text>
+                <TouchableOpacity 
+                  style={styles.refreshButton}
+                  onPress={async () => {
+                    await checkStorage();
+                  }}
+                >
+                  <Text style={styles.refreshButtonText}>Refresh</Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={styles.storageInfoSubtext}>
+                Images are stored on ImgBB's free cloud storage
+              </Text>
+            </View>
+          )}
+          
+          <FlatList
+            data={uploadedImages}
+            keyExtractor={(item, index) => `${item.name}-${index}`}
+            numColumns={2}
+            renderItem={({ item }) => (
+              <TouchableOpacity 
+                style={styles.gridImageItem}
+                onPress={() => {
+                  setSelectedImage(item);
+                }}
+              >
+                <Image
+                  source={{ uri: item.thumbnail || item.url }}
+                  style={styles.gridThumbnail}
+                  resizeMode="cover"
+                />
+                <View style={styles.gridImageDetails}>
+                  <Text style={styles.gridImageName} numberOfLines={1} ellipsizeMode="middle">
+                    {item.name.length > 20 ? item.name.substring(0, 18) + '...' : item.name}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            )}
+            contentContainerStyle={styles.imageGridList}
+            ListEmptyComponent={
+              <View style={styles.emptyList}>
+                <Text style={styles.emptyText}>No images uploaded yet. Capture some faces first!</Text>
+              </View>
+            }
+          />
         </View>
-      </View>
+      </Modal>
+
+      {/* Add this modal for viewing selected images */}
+      <Modal
+        visible={selectedImage !== null}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setSelectedImage(null)}
+      >
+        <TouchableOpacity 
+          style={styles.fullImageModalContainer} 
+          activeOpacity={1} 
+          onPress={() => setSelectedImage(null)}
+        >
+          <View style={styles.fullImageModalContent}>
+            <View style={styles.fullImageHeader}>
+              <Text style={styles.fullImageTitle} numberOfLines={1}>
+                {selectedImage?.name || 'Image Preview'}
+              </Text>
+              <TouchableOpacity 
+                style={styles.closeFullImageButton}
+                onPress={() => setSelectedImage(null)}
+              >
+                <Text style={styles.closeButtonText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={styles.fullImageWrapper}>
+              {selectedImage && (
+                <Image
+                  source={{ uri: selectedImage.url }}
+                  style={styles.fullImage}
+                  resizeMode="contain"
+                />
+              )}
+            </View>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </View>
   );
 }
@@ -442,20 +489,10 @@ const styles = StyleSheet.create({
     position: 'relative',
     backgroundColor: '#000',
     overflow: 'hidden',
-    backfaceVisibility: 'hidden',
   },
-  cameraFeed: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
+  webView: {
+    flex: 1,
     backgroundColor: '#000',
-    width: '100%',
-    height: '100%',
-    borderWidth: 0,
-    backfaceVisibility: 'hidden',
-    transform: [{ perspective: 1000 }],
   },
   noFeedContainer: {
     flex: 1,
@@ -467,30 +504,36 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
   },
-  faceIndicator: {
+  loadingContainer: {
     position: 'absolute',
-    borderWidth: 2,
-    borderColor: '#00ff00',
-    backgroundColor: 'transparent',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     justifyContent: 'center',
     alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    zIndex: 10,
   },
-  faceText: {
-    color: '#00ff00',
-    fontWeight: 'bold',
-    fontSize: 16,
+  loadingText: {
+    color: '#fff',
+    marginTop: 10,
   },
   buttonContainer: {
     padding: 15,
     backgroundColor: '#fff',
     borderTopWidth: 1,
     borderTopColor: '#ddd',
+    gap: 10,
   },
   button: {
     backgroundColor: '#2196F3',
     padding: 15,
     borderRadius: 5,
     alignItems: 'center',
+  },
+  storageButton: {
+    backgroundColor: '#FF9800',
   },
   buttonDisabled: {
     backgroundColor: '#cccccc',
@@ -500,42 +543,213 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     fontSize: 16,
   },
-  scanningText: {
-    fontStyle: 'italic',
-    color: '#666',
-  },
   manualButton: {
     backgroundColor: '#4CAF50',
     padding: 8,
     borderRadius: 5,
     marginTop: 10,
   },
-  qualityControls: {
-    marginTop: 10,
-    marginBottom: 10,
-  },
-  controlLabel: {
+  tapToDismissText: {
+    color: '#fff',
+    marginTop: 15,
+    opacity: 0.8,
     fontSize: 14,
-    marginBottom: 5,
   },
-  qualityButtons: {
+  retryButton: {
+    backgroundColor: '#4CAF50',
+    padding: 10,
+    borderRadius: 5,
+    marginTop: 15,
+  },
+  modalContainer: {
+    flex: 1,
+    backgroundColor: '#f5f5f5',
+  },
+  modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-  },
-  qualityButton: {
-    padding: 8,
-    borderRadius: 4,
-    backgroundColor: '#e0e0e0',
-    marginRight: 8,
-  },
-  activeQuality: {
+    alignItems: 'center',
+    padding: 15,
     backgroundColor: '#2196F3',
   },
-  qualityText: {
-    fontSize: 12,
-    color: '#333',
-  },
-  activeQualityText: {
+  modalTitle: {
     color: 'white',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  closeButton: {
+    padding: 8,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 4,
+  },
+  closeButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+  },
+  storageInfo: {
+    padding: 15,
+    backgroundColor: 'white',
+    marginBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#ddd',
+  },
+  storageInfoRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 5,
+  },
+  storageInfoText: {
+    fontSize: 16,
+    color: '#333',
+    fontWeight: 'bold',
+  },
+  storageInfoSubtext: {
+    fontSize: 14,
+    color: '#666',
+  },
+  refreshButton: {
+    backgroundColor: '#2196F3',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 4,
+  },
+  refreshButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+    fontSize: 12,
+  },
+  
+  // Grid view for images
+  imageGridList: {
+    padding: 5,
+  },
+  gridImageItem: {
+    flex: 1,
+    margin: 5,
+    backgroundColor: 'white',
+    borderRadius: 8,
+    overflow: 'hidden',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 1.5,
+    maxWidth: '48%',
+  },
+  gridThumbnail: {
+    width: '100%',
+    height: 150,
+    borderTopLeftRadius: 8,
+    borderTopRightRadius: 8,
+  },
+  gridImageDetails: {
+    padding: 8,
+  },
+  gridImageName: {
+    fontSize: 12,
+    fontWeight: '500',
+    textAlign: 'center',
+  },
+  
+  emptyList: {
+    padding: 50,
+    alignItems: 'center',
+  },
+  emptyText: {
+    fontSize: 16,
+    color: '#666',
+    fontStyle: 'italic',
+  },
+  viewButton: {
+    marginTop: 5,
+    padding: 5,
+    backgroundColor: '#2196F3',
+    borderRadius: 4,
+    alignSelf: 'flex-start',
+  },
+  viewButtonText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  fullImageModalContainer: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullImageBackdrop: {
+    flex: 1,
+    width: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullImageModalContent: {
+    backgroundColor: 'white',
+    borderRadius: 10,
+    width: '90%',
+    height: '80%',
+    overflow: 'hidden',
+    elevation: 5,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 5 },
+    shadowOpacity: 0.3,
+    shadowRadius: 5,
+  },
+  fullImageHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 15,
+    borderBottomWidth: 1,
+    borderBottomColor: '#ddd',
+    backgroundColor: '#2196F3',
+  },
+  fullImageTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: 'white',
+    flex: 1,
+    paddingRight: 10,
+  },
+  closeFullImageButton: {
+    padding: 8,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 4,
+  },
+  fullImageWrapper: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 10,
+    backgroundColor: '#000',
+  },
+  fullImage: {
+    width: '100%',
+    height: '100%',
+  },
+  imageActionBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 12,
+    backgroundColor: '#333',
+  },
+  imageTimestamp: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  imageActionButton: {
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    backgroundColor: '#2196F3',
+    borderRadius: 4,
+  },
+  actionButtonText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: 'bold',
   },
 }); 

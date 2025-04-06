@@ -1,2 +1,4 @@
 detected_faces/*
 !detected_faces/.gitkeep
+
+/node_modules

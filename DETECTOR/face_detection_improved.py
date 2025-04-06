@@ -232,12 +232,18 @@ class DNNFaceDetector:
             # Process detections based on model type
             if self.model_name == 'ssd_resnet':
                 for i in range(detections.shape[2]):
-                    confidence = detections[0, 0, i, 2]
+                    confidence = float(detections[0, 0, i, 2])
                     if confidence < self.threshold:
                         continue
                     
                     box = detections[0, 0, i, 3:7] * np.array([width, height, width, height])
                     (startX, startY, endX, endY) = box.astype("int")
+                    
+                    # Convert numpy integers to Python integers
+                    startX = int(startX)
+                    startY = int(startY)
+                    endX = int(endX)
+                    endY = int(endY)
                     
                     # Ensure coordinates are within frame
                     startX = max(0, startX)
@@ -249,11 +255,12 @@ class DNNFaceDetector:
                     if startX >= endX or startY >= endY:
                         continue
                     
+                    # Use standard Python types to avoid JSON serialization issues
                     faces.append({
-                        'x': startX,
-                        'y': startY,
-                        'width': endX - startX,
-                        'height': endY - startY,
+                        'x': int(startX),
+                        'y': int(startY),
+                        'width': int(endX - startX),
+                        'height': int(endY - startY),
                         'confidence': float(confidence)
                     })
             
@@ -266,7 +273,7 @@ class DNNFaceDetector:
                 for i in range(0, detections.shape[1]):
                     try:
                         # Format may vary by model - adjust indices as needed
-                        confidence = detections[0, i, 4]
+                        confidence = float(detections[0, i, 4])
                         if confidence < self.threshold:
                             continue
                         
@@ -286,11 +293,12 @@ class DNNFaceDetector:
                         if x1 >= x2 or y1 >= y2:
                             continue
                         
+                        # Use standard Python types
                         faces.append({
-                            'x': x1,
-                            'y': y1,
-                            'width': x2 - x1,
-                            'height': y2 - y1,
+                            'x': int(x1),
+                            'y': int(y1),
+                            'width': int(x2 - x1),
+                            'height': int(y2 - y1),
                             'confidence': float(confidence)
                         })
                     except IndexError:
@@ -511,9 +519,13 @@ def camera_processing():
                 
                 # Draw rectangles for detected faces
                 for face in faces_data:
-                    x, y, w, h = face['x'], face['y'], face['width'], face['height']
-                    conf = face['confidence']
-                    method = face['method']
+                    # Ensure all values are serializable
+                    x = int(face['x'])
+                    y = int(face['y'])
+                    w = int(face['width'])
+                    h = int(face['height'])
+                    conf = float(face['confidence'])
+                    method = str(face['method'])
                     
                     # Use different colors based on detection method
                     color = (0, 255, 0)  # Default green
@@ -533,19 +545,42 @@ def camera_processing():
                     # Draw landmarks if available
                     if 'landmarks' in face:
                         for landmark in face['landmarks']:
-                            cv2.circle(output_frame, landmark, 2, (0, 0, 255), -1)
+                            # Ensure landmarks are serializable
+                            lx = int(landmark[0])
+                            ly = int(landmark[1])
+                            cv2.circle(output_frame, (lx, ly), 2, (0, 0, 255), -1)
                 
                 # Convert frame for streaming
                 encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
                 _, buffer = cv2.imencode('.jpg', output_frame, encode_params)
                 current_frame_encoded = base64.b64encode(buffer).decode('utf-8')
                 
-                # Emit frame update
-                socketio.emit('frame_update', {
-                    'image': current_frame_encoded,
-                    'faces': faces_data,
-                    'timestamp': current_time
-                })
+                # Create a serializable copy of faces_data
+                serializable_faces = []
+                for face in faces_data:
+                    serializable_face = {
+                        'x': int(face['x']),
+                        'y': int(face['y']),
+                        'width': int(face['width']),
+                        'height': int(face['height']),
+                        'confidence': float(face['confidence']),
+                        'method': str(face['method'])
+                    }
+                    # Only include landmarks if present
+                    if 'landmarks' in face:
+                        serializable_face['landmarks'] = [(int(l[0]), int(l[1])) for l in face['landmarks']]
+                    serializable_faces.append(serializable_face)
+                
+                # Emit frame update with serializable data
+                try:
+                    socketio.emit('frame_update', {
+                        'image': current_frame_encoded,
+                        'faces': serializable_faces,
+                        'timestamp': float(current_time)
+                    })
+                except Exception as e:
+                    print(f"Error emitting frame update: {e}")
+                    traceback.print_exc()
                 
                 last_frame_time = current_time
                 
@@ -556,12 +591,17 @@ def camera_processing():
                         last_notification_time = current_time
                         face_detected = True
                         
-                        socketio.emit('face_detected', {
-                            'count': len(faces_data),
-                            'timestamp': current_time,
-                            'image': current_frame_encoded,
-                            'faces': faces_data
-                        })
+                        # Emit face detection event with serializable data
+                        try:
+                            socketio.emit('face_detected', {
+                                'count': int(len(faces_data)),
+                                'timestamp': float(current_time),
+                                'image': current_frame_encoded,
+                                'faces': serializable_faces
+                            })
+                        except Exception as e:
+                            print(f"Error emitting face detection event: {e}")
+                            traceback.print_exc()
                 else:
                     face_detected = False
             
@@ -1345,6 +1385,12 @@ def detect_faces(frame, detect_params=None):
                     if model_faces:
                         for face in model_faces:
                             face['method'] = model_name
+                            # Make sure all values are standard Python types, not NumPy types
+                            face['x'] = int(face['x'])
+                            face['y'] = int(face['y'])
+                            face['width'] = int(face['width'])
+                            face['height'] = int(face['height'])
+                            face['confidence'] = float(face['confidence'])
                             face_data.append(face)
                             
                             # Create face crops

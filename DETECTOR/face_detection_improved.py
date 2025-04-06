@@ -15,6 +15,7 @@ import urllib.request
 import shutil
 import hashlib
 import math
+import glob
 
 # Create Flask and Socket.io app
 app = Flask(__name__)
@@ -73,6 +74,71 @@ def get_local_ip():
         s.close()
     return IP
 
+def get_available_cameras():
+    """Detect available video devices on the system"""
+    available_cameras = []
+    try:
+        # Check for video devices in /dev
+        video_devices = glob.glob('/dev/video*')
+        if video_devices:
+            print(f"Found {len(video_devices)} potential video devices")
+            
+            # First try devices that are likely actual cameras
+            # Test a range of values including standard webcam indices
+            test_indices = [0, 1, 2]  # Standard webcam indices
+            
+            # Add potential USB camera indices from devices list
+            for device in video_devices:
+                try:
+                    idx = int(device.replace('/dev/video', ''))
+                    # Only test indices not already in the list
+                    if idx not in test_indices:
+                        test_indices.append(idx)
+                except ValueError:
+                    pass
+            
+            print(f"Testing camera indices: {test_indices}")
+            
+            # Test each camera
+            for idx in test_indices:
+                try:
+                    # Try V4L2 first (Linux)
+                    cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                    if cap is None or not cap.isOpened():
+                        # Try without specific backend
+                        cap = cv2.VideoCapture(idx)
+                    
+                    if cap is not None and cap.isOpened():
+                        # Try to read a frame to confirm it works
+                        ret, frame = cap.read()
+                        if ret and frame is not None:
+                            print(f"Found working camera at index {idx}")
+                            available_cameras.append(idx)
+                        cap.release()
+                except Exception as e:
+                    print(f"Error testing camera {idx}: {e}")
+            
+            # If no cameras were found, try using the first few video device indices
+            if not available_cameras and video_devices:
+                print("No cameras verified, using first few video devices as fallback")
+                for device in sorted(video_devices)[:5]:  # Try first 5 devices
+                    try:
+                        idx = int(device.replace('/dev/video', ''))
+                        available_cameras.append(idx)
+                    except ValueError:
+                        pass
+        
+        # Default fallback indices if no devices were found
+        if not available_cameras:
+            available_cameras = [0, 1, 2]
+            print("No verified cameras, using default indices")
+            
+    except Exception as e:
+        available_cameras = [0, 1, 2]
+        print(f"Error detecting video devices: {e}")
+    
+    return available_cameras
+
 def register_service():
     """Register the face detection service using Zeroconf"""
     local_ip = get_local_ip()
@@ -128,7 +194,7 @@ def init_feature_detectors():
         return False
 
 class DNNFaceDetector:
-    """Class to handle different DNN face detection models"""
+    """Class to handle DNN face detection models (simplified to SSD only)"""
     def __init__(self, model_name):
         self.model_name = model_name
         self.net = None
@@ -138,49 +204,20 @@ class DNNFaceDetector:
     def initialize(self):
         """Initialize the DNN model"""
         try:
-            if self.model_name == 'ssd_resnet':
-                model_path = os.path.join(FACE_DETECTOR_DIR, 'res10_300x300_ssd_iter_140000.caffemodel')
-                config_path = os.path.join(FACE_DETECTOR_DIR, 'deploy.prototxt')
-                
-                if not os.path.exists(model_path) or not os.path.exists(config_path):
-                    print(f"Model files not found for SSD ResNet: {model_path}")
-                    return False
-                
-                self.net = cv2.dnn.readNetFromCaffe(config_path, model_path)
-                self.size = (300, 300)
-                self.scale = 1.0
-                self.mean = [104.0, 177.0, 123.0]
-                self.threshold = 0.5
-                self.swapRB = True
+            # Only initialize SSD ResNet model
+            model_path = os.path.join(FACE_DETECTOR_DIR, 'res10_300x300_ssd_iter_140000.caffemodel')
+            config_path = os.path.join(FACE_DETECTOR_DIR, 'deploy.prototxt')
             
-            elif self.model_name == 'yunet':
-                model_path = os.path.join(FACE_DETECTOR_DIR, 'yunet.onnx')
-                
-                if not os.path.exists(model_path):
-                    print(f"Model file not found for YuNet: {model_path}")
-                    return False
-                
-                self.net = cv2.dnn.readNetFromONNX(model_path)
-                self.size = (320, 320)
-                self.scale = 1.0
-                self.mean = [127.5, 127.5, 127.5]
-                self.std = [128.0, 128.0, 128.0]
-                self.threshold = 0.6
-                self.swapRB = True
-                
-            elif self.model_name == 'retinaface':
-                model_path = os.path.join(FACE_DETECTOR_DIR, 'retinaface.onnx')
-                
-                if not os.path.exists(model_path):
-                    print(f"Model file not found for RetinaFace: {model_path}")
-                    return False
-                
-                self.net = cv2.dnn.readNetFromONNX(model_path)
-                self.size = (640, 640)
-                self.scale = 1.0/255.0
-                self.mean = [104.0, 117.0, 123.0]
-                self.threshold = 0.7
-                self.swapRB = True
+            if not os.path.exists(model_path) or not os.path.exists(config_path):
+                print(f"Model files not found for SSD ResNet: {model_path}")
+                return False
+            
+            self.net = cv2.dnn.readNetFromCaffe(config_path, model_path)
+            self.size = (300, 300)
+            self.scale = 1.0
+            self.mean = [104.0, 177.0, 123.0]
+            self.threshold = 0.5
+            self.swapRB = True
             
             # Set computation preferences for better performance on Raspberry Pi
             if self.net is not None:
@@ -210,92 +247,42 @@ class DNNFaceDetector:
         
         try:
             # Prepare input blob
-            if hasattr(self, 'std'):
-                # Normalize using mean and std
-                blob = cv2.dnn.blobFromImage(
-                    frame, self.scale, self.size,
-                    mean=self.mean,
-                    std=self.std,
-                    swapRB=self.swapRB
-                )
-            else:
-                # Use simple mean subtraction
-                blob = cv2.dnn.blobFromImage(
-                    frame, self.scale, self.size,
-                    mean=self.mean,
-                    swapRB=self.swapRB
-                )
+            blob = cv2.dnn.blobFromImage(
+                frame, self.scale, self.size,
+                mean=self.mean,
+                swapRB=self.swapRB
+            )
             
             self.net.setInput(blob)
             detections = self.net.forward()
             
-            # Process detections based on model type
-            if self.model_name == 'ssd_resnet':
-                for i in range(detections.shape[2]):
-                    confidence = detections[0, 0, i, 2]
-                    if confidence < self.threshold:
-                        continue
-                    
-                    box = detections[0, 0, i, 3:7] * np.array([width, height, width, height])
-                    (startX, startY, endX, endY) = box.astype("int")
-                    
-                    # Ensure coordinates are within frame
-                    startX = max(0, startX)
-                    startY = max(0, startY)
-                    endX = min(width, endX)
-                    endY = min(height, endY)
-                    
-                    # Skip invalid detections
-                    if startX >= endX or startY >= endY:
-                        continue
-                    
-                    faces.append({
-                        'x': startX,
-                        'y': startY,
-                        'width': endX - startX,
-                        'height': endY - startY,
-                        'confidence': float(confidence)
-                    })
-            
-            elif self.model_name == 'yunet' or self.model_name == 'retinaface':
-                # These models may have different output formats
-                # For simplicity, we're providing a basic implementation that works with some ONNX models
-                # This would need to be adapted to the specific model's output format
+            # Process detections for SSD ResNet
+            for i in range(detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
+                if confidence < self.threshold:
+                    continue
                 
-                # Simple approach - assumes detections are in flattened format with confidence, x, y, width, height
-                for i in range(0, detections.shape[1]):
-                    try:
-                        # Format may vary by model - adjust indices as needed
-                        confidence = detections[0, i, 4]
-                        if confidence < self.threshold:
-                            continue
-                        
-                        # Get coordinates (format depends on model)
-                        x1 = int(detections[0, i, 0] * width)
-                        y1 = int(detections[0, i, 1] * height)
-                        x2 = int(detections[0, i, 2] * width)
-                        y2 = int(detections[0, i, 3] * height)
-                        
-                        # Ensure coordinates are within frame and valid
-                        x1 = max(0, x1)
-                        y1 = max(0, y1)
-                        x2 = min(width, x2)
-                        y2 = min(height, y2)
-                        
-                        # Skip invalid detections
-                        if x1 >= x2 or y1 >= y2:
-                            continue
-                        
-                        faces.append({
-                            'x': x1,
-                            'y': y1,
-                            'width': x2 - x1,
-                            'height': y2 - y1,
-                            'confidence': float(confidence)
-                        })
-                    except IndexError:
-                        # Skip problematic detections
-                        continue
+                box = detections[0, 0, i, 3:7] * np.array([width, height, width, height])
+                (startX, startY, endX, endY) = box.astype("int")
+                
+                # Ensure coordinates are within frame
+                startX = max(0, startX)
+                startY = max(0, startY)
+                endX = min(width, endX)
+                endY = min(height, endY)
+                
+                # Skip invalid detections
+                if startX >= endX or startY >= endY:
+                    continue
+                
+                faces.append({
+                    'x': startX,
+                    'y': startY,
+                    'width': endX - startX,
+                    'height': endY - startY,
+                    'confidence': float(confidence),
+                    'method': 'ssd_resnet'
+                })
             
             return faces
             
@@ -305,25 +292,23 @@ class DNNFaceDetector:
             return []
 
 def init_face_detectors():
-    """Initialize face detectors including multiple DNN models"""
+    """Initialize face detectors including SSD and Haar cascade (removing YuNet and RetinaFace)"""
     global face_detector, face_net, dnn_detectors
     
     success = True
     dnn_detectors = {}
     
-    # Initialize DNN detectors - try different models that might be available
-    model_names = ['ssd_resnet', 'yunet', 'retinaface']
-    for model_name in model_names:
-        try:
-            detector = DNNFaceDetector(model_name)
-            if detector.initialized:
-                dnn_detectors[model_name] = detector
-                print(f"Successfully initialized {model_name} detector")
-            else:
-                print(f"Failed to initialize {model_name} detector - model may not be available")
-        except Exception as e:
-            print(f"Error initializing {model_name} detector: {e}")
-            success = False
+    # Initialize only SSD detector
+    try:
+        detector = DNNFaceDetector('ssd_resnet')
+        if detector.initialized:
+            dnn_detectors['ssd_resnet'] = detector
+            print(f"Successfully initialized ssd_resnet detector")
+        else:
+            print(f"Failed to initialize ssd_resnet detector")
+    except Exception as e:
+        print(f"Error initializing ssd_resnet detector: {e}")
+        success = False
     
     # Initialize Haar cascade as fallback
     try:
@@ -331,33 +316,45 @@ def init_face_detectors():
         cascade_path = os.path.join(CASCADE_DIR, 'haarcascade_frontalface_default.xml')
         if os.path.exists(cascade_path):
             face_detector = cv2.CascadeClassifier(cascade_path)
-        else:
-            # Fall back to OpenCV's built-in cascades
-            cascade_file = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            face_detector = cv2.CascadeClassifier(cascade_file)
-            
-        if face_detector.empty():
-            print("Error loading Haar cascade face detector")
-            
-            # One more fallback attempt - try the alt version
-            alt_cascade = cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
-            face_detector = cv2.CascadeClassifier(alt_cascade)
-            
-            if face_detector.empty():
-                print("Error loading alternative Haar cascade detector")
-                success = False
+            if not face_detector.empty():
+                print("Successfully initialized Haar cascade face detector")
             else:
-                print("Successfully initialized alternative Haar cascade face detector")
+                print("Error: Haar cascade file exists but couldn't be loaded")
+                face_detector = None
         else:
-            print("Successfully initialized Haar cascade face detector")
+            # Check if we need to download the cascade file
+            if not os.path.exists(CASCADE_DIR):
+                os.makedirs(CASCADE_DIR)
+            
+            # Download directly from GitHub
+            try:
+                cascade_url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+                print(f"Downloading Haar cascade from {cascade_url}")
+                urllib.request.urlretrieve(cascade_url, cascade_path)
+                if os.path.exists(cascade_path):
+                    face_detector = cv2.CascadeClassifier(cascade_path)
+                    if not face_detector.empty():
+                        print("Successfully downloaded and initialized Haar cascade")
+                    else:
+                        print("Error: Downloaded Haar cascade file couldn't be loaded")
+                        face_detector = None
+                else:
+                    print("Failed to download Haar cascade")
+                    face_detector = None
+            except Exception as e:
+                print(f"Error downloading cascade file: {e}")
+                face_detector = None
     except Exception as e:
         print(f"Error initializing Haar cascade face detector: {e}")
+        face_detector = None
         success = False
     
     # Make sure we have at least one working detector
     if not dnn_detectors and (face_detector is None or face_detector.empty()):
         print("ERROR: No working face detectors available!")
         success = False
+    else:
+        success = True
     
     return success
 
@@ -367,83 +364,89 @@ def camera_processing():
     
     print("Starting camera processing with enhanced face detection")
     
-    # Initialize camera with fallback options
-    camera_indexes = [0, 1, 2]  # Try multiple camera indexes including Raspberry Pi cam
+    # We've verified camera index 0 works from our test_camera.py
+    print("Using camera index 0 (verified working camera)")
     cap = None
     
-    # For Raspberry Pi - check for Pi camera
-    pi_camera = False
-    picam2 = None
+    # Explicitly use V4L2 backend and disable GStreamer
+    # This works better with most USB webcams on Raspberry Pi
+    print("Initializing camera with explicit V4L2 backend...")
     try:
-        # Check if running on Raspberry Pi
-        if os.path.exists('/sys/firmware/devicetree/base/model'):
-            with open('/sys/firmware/devicetree/base/model', 'r') as f:
-                model = f.read()
-                if 'Raspberry Pi' in model:
-                    print("Detected Raspberry Pi hardware")
-                    # Try to import picamera2 (better Raspberry Pi camera support)
-                    try:
-                        # Only import picamera2 if we're on a Raspberry Pi
-                        # This avoids the import error on non-Pi systems
-                        import importlib
-                        picamera2_module = importlib.import_module('picamera2')
-                        Picamera2 = picamera2_module.Picamera2
-                        
-                        picam2 = Picamera2()
-                        # Configure the camera for a reasonable resolution
-                        picam2.configure(picam2.create_preview_configuration(
-                            main={"size": (640, 480), "format": "RGB888"}))
-                        picam2.start()
-                        pi_camera = True
-                        print("Successfully initialized Raspberry Pi camera using picamera2")
-                    except ImportError:
-                        print("picamera2 not available, trying standard OpenCV camera")
-                    except Exception as e:
-                        print(f"Error initializing Pi camera: {e}")
-    except Exception as e:
-        print(f"Error checking for Raspberry Pi: {e}")
-    
-    # If Pi camera initialization failed or not running on Pi, try OpenCV cameras
-    if not pi_camera:
-        for idx in camera_indexes:
-            try:
-                # First try with DirectShow (Windows)
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                if cap is None or not cap.isOpened():
-                    # Try V4L2 (Linux/Raspberry Pi)
-                    cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-                    if cap is None or not cap.isOpened():
-                        # Try without specific backend
-                        cap = cv2.VideoCapture(idx)
-                        if cap is None or not cap.isOpened():
-                            print(f"Failed to open camera with index {idx}")
-                            continue
-                    
-                # Check if we can read a frame
+        # Try V4L2 backend first with MJPEG format which has better compatibility
+        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        
+        if cap.isOpened():
+            # Try to set pixel format to MJPG for better compatibility
+            # This is a crucial setting for many webcams
+            print("Setting V4L2 format to MJPG...")
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+        
+        if not cap.isOpened():
+            print("V4L2 backend failed, trying default backend...")
+            cap = cv2.VideoCapture(0)
+            
+            if cap.isOpened():
+                # Try setting pixel format on default backend too
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+        
+        if cap is not None and cap.isOpened():
+            # Verify with a test frame
+            for i in range(5):  # Try up to 5 times
                 ret, test_frame = cap.read()
                 if ret and test_frame is not None:
-                    print(f"Successfully initialized camera with index {idx}")
+                    print(f"✅ Successfully initialized camera with index 0, resolution: {test_frame.shape[1]}x{test_frame.shape[0]}")
                     break
-                else:
-                    print(f"Could not read frame from camera {idx}")
-                    cap.release()
-                    cap = None
-            except Exception as e:
-                print(f"Error initializing camera {idx}: {e}")
-                if cap is not None:
-                    cap.release()
-                    cap = None
-    
-    if cap is None and not pi_camera:
-        print("Failed to initialize any camera")
+                time.sleep(0.5)
+            else:
+                print("Warning: Could open camera but got no frames in initial test")
+        else:
+            print("Failed to open camera 0 - please check connection")
+            return
+    except Exception as e:
+        print(f"Error initializing camera: {e}")
         return
     
-    # Set camera properties for better performance if using OpenCV
+    # Set camera properties for better performance
     if cap is not None:
         try:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 15)  # Lower FPS for better performance on Raspberry Pi
+            # For Raspberry Pi, use a lower resolution for better performance
+            # Try multiple resolutions from lowest to highest until one works
+            resolutions = [(640, 480), (800, 600), (1024, 576), (1280, 720)]
+            
+            # Get current resolution
+            current_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            current_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"Default camera resolution: {current_width}x{current_height}")
+            
+            # Try a lower resolution for better performance
+            success = False
+            for width, height in resolutions:
+                # Skip higher resolutions than current
+                if width >= current_width and height >= current_height:
+                    continue
+                    
+                print(f"Trying resolution {width}x{height}...")
+                w_success = cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                h_success = cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                
+                if w_success and h_success:
+                    # Verify the changes took effect
+                    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    
+                    if abs(actual_width - width) < 50 and abs(actual_height - height) < 50:
+                        print(f"Resolution set to {actual_width}x{actual_height}")
+                        success = True
+                        break
+            
+            if not success:
+                print(f"Keeping original resolution: {current_width}x{current_height}")
+            
+            # Try to set other parameters that might improve stability
+            cap.set(cv2.CAP_PROP_FPS, 15)        # Lower FPS
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Increase buffer size
+            
+            print("Camera properties configured")
         except Exception as e:
             print(f"Warning: Could not set camera properties: {e}")
     
@@ -455,31 +458,41 @@ def camera_processing():
     frame_count = 0
     last_detection_attempt = 0
     detection_interval = 0.25  # Only try detection every 4 frames to improve performance
-    
-    # For Raspberry Pi - slower processing to avoid overheating
-    if pi_camera:
-        detection_interval = 0.5  # Every 2 seconds
-        frame_interval = 0.3     # ~3 FPS
+    consecutive_failures = 0
+    max_failures = 10  # Maximum consecutive failures before trying to reconnect
     
     print("Enhanced face detection system started. Press 'q' to quit.")
     
     while not stop_signal:
         try:
-            # Get frame based on camera type
-            if pi_camera:
-                # Get frame from picamera2
-                frame = picam2.capture_array()
-                # Convert from RGB to BGR (OpenCV format)
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                ret = True
-            else:
-                # Get frame from OpenCV camera
-                ret, frame = cap.read()
+            # Get frame from OpenCV camera
+            ret, frame = cap.read()
             
             if not ret or frame is None:
-                print("Failed to grab frame, retrying...")
+                consecutive_failures += 1
+                print(f"Failed to grab frame, retrying... ({consecutive_failures}/{max_failures})")
+                
+                if consecutive_failures >= max_failures:
+                    print("Too many consecutive failures, trying to reconnect camera...")
+                    # Close and reopen the camera
+                    cap.release()
+                    time.sleep(1)
+                    
+                    # Reinitialize with V4L2
+                    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+                    if not cap.isOpened():
+                        print("Reconnection failed, trying again in 5 seconds...")
+                        time.sleep(5)
+                        continue
+                        
+                    print("Camera reconnected!")
+                    consecutive_failures = 0
+                
                 time.sleep(0.5)
                 continue
+            
+            # Reset failure counter on success
+            consecutive_failures = 0
             
             # Store the current frame for streaming
             current_frame = frame.copy()
@@ -498,9 +511,9 @@ def camera_processing():
                 
                 # Only run detection at specific intervals to improve performance
                 if do_detection:
-                    # Detect faces using our function with priority for YuNet
+                    # Detect faces using our function with priority for SSD ResNet
                     detection_result = detect_faces(frame, {
-                        'method': 'auto',
+                        'method': 'ssd_resnet',
                         'min_confidence': 0.5,
                         'min_face_size': 30
                     })
@@ -517,12 +530,8 @@ def camera_processing():
                     
                     # Use different colors based on detection method
                     color = (0, 255, 0)  # Default green
-                    if method == 'yunet':
-                        color = (0, 255, 255)  # Yellow for YuNet
-                    elif method == 'ssd_resnet':
+                    if method == 'ssd_resnet':
                         color = (255, 0, 255)  # Purple for SSD ResNet
-                    elif method == 'retinaface':
-                        color = (255, 255, 0)  # Cyan for RetinaFace
                     elif 'haar' in method:
                         color = (0, 165, 255)  # Orange for Haar cascade
                     
@@ -588,12 +597,7 @@ def camera_processing():
             time.sleep(1)  # Wait before retrying
     
     # Cleanup
-    if pi_camera:
-        try:
-            picam2.stop()
-        except:
-            pass
-    elif cap is not None:
+    if cap is not None:
         cap.release()
     
     cv2.destroyAllWindows()
@@ -789,18 +793,18 @@ def handle_capture_request():
         
         # Detect faces using our function with both detection methods for better results
         try:
-            # Try DNN first (more accurate but might not be available)
-            result_dnn = detect_faces(capture_frame, {'method': 'dnn', 'min_confidence': 0.5})
+            # Try SSD ResNet first (more accurate but might not be available)
+            result_ssd = detect_faces(capture_frame, {'method': 'ssd_resnet', 'min_confidence': 0.5})
             # Also try Haar cascade (more reliable but less accurate)
             result_haar = detect_faces(capture_frame, {'method': 'haar'})
             
             # Use the result with more faces, or default to Haar cascade result
-            if result_dnn['num_faces'] > result_haar['num_faces']:
-                print(f"Using DNN detection with {result_dnn['num_faces']} faces")
-                detect_result = result_dnn
-                faces_data = result_dnn['faces']
+            if result_ssd['num_faces'] > result_haar['num_faces']:
+                print(f"Using ssd_resnet detection with {result_ssd['num_faces']} faces")
+                detect_result = result_ssd
+                faces_data = result_ssd['faces']
             else:
-                print(f"Using Haar detection with {result_haar['num_faces']} faces")
+                print(f"Using haar detection with {result_haar['num_faces']} faces")
                 detect_result = result_haar
                 faces_data = result_haar['faces']
             
@@ -809,8 +813,8 @@ def handle_capture_request():
             if len(last_capture_faces) == 0 and len(faces_data) > 0:
                 print("No face crops in last_capture_faces, but faces were detected. Recapturing...")
                 # Try again with the method that worked better
-                if result_dnn['num_faces'] > result_haar['num_faces']:
-                    detect_faces(capture_frame, {'method': 'dnn', 'min_confidence': 0.5})
+                if result_ssd['num_faces'] > result_haar['num_faces']:
+                    detect_faces(capture_frame, {'method': 'ssd_resnet', 'min_confidence': 0.5})
                 else:
                     detect_faces(capture_frame, {'method': 'haar'})
             
@@ -1033,11 +1037,11 @@ def perform_self_test():
         
         # Try different detection methods
         # First with DNN if available
-        params = {'method': 'dnn', 'min_confidence': 0.3}
+        params = {'method': 'ssd_resnet', 'min_confidence': 0.3}
         result = detect_faces(test_img, params)
         
         if result['num_faces'] > 0:
-            print(f"✅ Self-test PASSED with DNN: Detected {result['num_faces']} faces in test image")
+            print(f"✅ Self-test PASSED with ssd_resnet: Detected {result['num_faces']} faces in test image")
             return True
             
         # If DNN fails, try Haar cascade
@@ -1045,7 +1049,7 @@ def perform_self_test():
         result = detect_faces(test_img, params)
         
         if result['num_faces'] > 0:
-            print(f"✅ Self-test PASSED with Haar cascade: Detected {result['num_faces']} faces in test image")
+            print(f"✅ Self-test PASSED with haar: Detected {result['num_faces']} faces in test image")
             return True
         else:
             print("❌ Self-test FAILED: No faces detected in test image")
@@ -1113,11 +1117,11 @@ def test_detection():
         cv2.ellipse(test_img, (200, 260), (60, 25), 0, 0, 180, (151, 104, 138), -1)
         
         # Try different detection methods to see which one works better
-        result_dnn = detect_faces(test_img, {'method': 'dnn', 'min_confidence': 0.3})
+        result_ssd = detect_faces(test_img, {'method': 'ssd_resnet', 'min_confidence': 0.3})
         result_haar = detect_faces(test_img, {'method': 'haar'})
         
         # Use the result with more faces, or default to Haar cascade result
-        result = result_dnn if result_dnn['num_faces'] >= result_haar['num_faces'] and result_dnn['num_faces'] > 0 else result_haar
+        result = result_ssd if result_ssd['num_faces'] >= result_haar['num_faces'] and result_ssd['num_faces'] > 0 else result_haar
         
         # Add the test image to the response
         _, buffer = cv2.imencode('.jpg', test_img)
@@ -1163,17 +1167,17 @@ def handle_single_face_request(data):
     
     # Detect faces using our function with both detection methods for better results
     try:
-        # Try DNN first (more accurate but might not be available)
-        result_dnn = detect_faces(capture_frame, {'method': 'dnn', 'min_confidence': 0.5})
+        # Try SSD ResNet first (more accurate but might not be available)
+        result_ssd = detect_faces(capture_frame, {'method': 'ssd_resnet', 'min_confidence': 0.5})
         # Also try Haar cascade (more reliable but less accurate)
         result_haar = detect_faces(capture_frame, {'method': 'haar'})
         
         # Use the result with more faces, or default to Haar cascade result
-        if result_dnn['num_faces'] > result_haar['num_faces']:
-            print(f"Using DNN detection with {result_dnn['num_faces']} faces")
-            faces_data = result_dnn['faces']
+        if result_ssd['num_faces'] > result_haar['num_faces']:
+            print(f"Using ssd_resnet detection with {result_ssd['num_faces']} faces")
+            faces_data = result_ssd['faces']
         else:
-            print(f"Using Haar detection with {result_haar['num_faces']} faces")
+            print(f"Using haar detection with {result_haar['num_faces']} faces")
             faces_data = result_haar['faces']
         
         if not faces_data or face_index >= len(faces_data):
@@ -1305,13 +1309,13 @@ def calculate_face_quality(face_roi):
 
 def detect_faces(frame, detect_params=None):
     """
-    Detect faces using multiple DNN models and Haar cascade with priority for YuNet
+    Detect faces using multiple DNN models and Haar cascade with priority for SSD ResNet
     """
     if detect_params is None:
         detect_params = {}
     
     # Extract parameters with defaults
-    method = detect_params.get('method', 'auto')  # auto, dnn, haar
+    method = detect_params.get('method', 'ssd_resnet')
     min_confidence = detect_params.get('min_confidence', 0.5)
     min_face_size = detect_params.get('min_face_size', 30)  # Minimum size in pixels
     
@@ -1329,48 +1333,47 @@ def detect_faces(frame, detect_params=None):
         # For small frames, slightly enhance contrast for better detection
         process_frame = cv2.convertScaleAbs(process_frame, alpha=1.1, beta=5)
     
-    # Auto method - try DNN first, then fallback to Haar
-    if method == 'auto' or method == 'dnn':
-        # Try each DNN detector in order of preference
-        dnn_preference = ['yunet', 'ssd_resnet', 'retinaface']  # Order by preference
-        
-        for model_name in dnn_preference:
-            if model_name in dnn_detectors:
-                try:
-                    model_faces = dnn_detectors[model_name].detect(process_frame)
+    # Auto method - try SSD ResNet first, then fallback to Haar
+    if method == 'ssd_resnet':
+        try:
+            model_faces = dnn_detectors['ssd_resnet'].detect(process_frame)
+            
+            # Filter by confidence
+            model_faces = [f for f in model_faces if f['confidence'] >= min_confidence]
+            
+            if model_faces:
+                for face in model_faces:
+                    face['method'] = 'ssd_resnet'
+                    face_data.append(face)
                     
-                    # Filter by confidence
-                    model_faces = [f for f in model_faces if f['confidence'] >= min_confidence]
+                    # Create face crops
+                    x, y, w, h = face['x'], face['y'], face['width'], face['height']
+                    # Add padding for better face recognition (20%)
+                    pad_w = int(w * 0.2)
+                    pad_h = int(h * 0.2)
+                    crop_x = max(0, x - pad_w)
+                    crop_y = max(0, y - pad_h)
+                    crop_w = min(width - crop_x, w + 2*pad_w)
+                    crop_h = min(height - crop_y, h + 2*pad_h)
                     
-                    if model_faces:
-                        for face in model_faces:
-                            face['method'] = model_name
-                            face_data.append(face)
-                            
-                            # Create face crops
-                            x, y, w, h = face['x'], face['y'], face['width'], face['height']
-                            # Add padding for better face recognition (20%)
-                            pad_w = int(w * 0.2)
-                            pad_h = int(h * 0.2)
-                            crop_x = max(0, x - pad_w)
-                            crop_y = max(0, y - pad_h)
-                            crop_w = min(width - crop_x, w + 2*pad_w)
-                            crop_h = min(height - crop_y, h + 2*pad_h)
-                            
-                            if crop_w > 0 and crop_h > 0:
-                                face_crop = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-                                face_crop_data = face.copy()
-                                face_crop_data['crop'] = face_crop
-                                face_crops.append(face_crop_data)
-                        
-                        # If we found faces with this detector, stop trying others
-                        if face_data:
-                            break
-                except Exception as e:
-                    print(f"Error with {model_name} detector: {e}")
+                    if crop_w > 0 and crop_h > 0:
+                        face_crop = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+                        face_crop_data = face.copy()
+                        face_crop_data['crop'] = face_crop
+                        face_crops.append(face_crop_data)
+                
+                # If we found faces with this detector, stop trying others
+                if face_data:
+                    return {
+                        'num_faces': len(face_data),
+                        'faces': face_data,
+                        'detection_method': 'ssd_resnet'
+                    }
+        except Exception as e:
+            print(f"Error with ssd_resnet detector: {e}")
     
     # Fall back to Haar cascade if needed or specifically requested
-    if (method == 'auto' and not face_data) or method == 'haar':
+    if (method == 'ssd_resnet' and not face_data) or method == 'haar':
         try:
             if face_detector is not None and not face_detector.empty():
                 # Convert to grayscale for Haar cascade
@@ -1457,7 +1460,7 @@ def detect_faces(frame, detect_params=None):
                                 face_crop_data['crop'] = face_crop
                                 face_crops.append(face_crop_data)
         except Exception as e:
-            print(f"Error with Haar cascade detector: {e}")
+            print(f"Error with haar detector: {e}")
     
     # Perform Non-Maximum Suppression (NMS) to filter out overlapping detections
     if len(face_data) > 1:
@@ -1511,9 +1514,7 @@ def generate_frames():
                 conf = face['confidence']
                 method = face['method']
                 color = (0, 255, 0)  # Default green
-                if method == 'yunet':
-                    color = (0, 255, 255)  # Yellow for YuNet
-                elif method == 'ssd_resnet':
+                if method == 'ssd_resnet':
                     color = (255, 0, 255)  # Purple for SSD ResNet
                 cv2.rectangle(output_frame, (x, y), (x+w, y+h), color, 2)
                 cv2.putText(output_frame, f"{method} ({conf:.2f})", (x, y-10), 
